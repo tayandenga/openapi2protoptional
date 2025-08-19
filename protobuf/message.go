@@ -53,6 +53,10 @@ func (f *Field) SetRepeated(b bool) {
 	f.repeated = b
 }
 
+func (f *Field) SetOptional(b bool) {
+	f.optional = b
+}
+
 // NewMessage creates a new Message
 func NewMessage(name string) *Message {
 	return &Message{

@@ -201,6 +201,7 @@ func (c *compileCtx) compileParameters(parameters map[string]*openapi.Parameter)
 
 		pname := m.Name()
 		repeated := false
+		optional := false
 
 		// Now this is really really annoying, but sometimes the values in
 		// #/parameters/* contains a "name" field, which is the name used
@@ -214,11 +215,15 @@ func (c *compileCtx) compileParameters(parameters map[string]*openapi.Parameter)
 		if param.Items != nil {
 			repeated = true
 		}
+		if !param.Required {
+			optional = true
+		}
 
 		m = &Parameter{
 			Type:          m,
 			parameterName: pname,
 			repeated:      repeated,
+			optional:      optional,
 		}
 		c.addDefinition("#/parameters/"+ref, m)
 	}
@@ -667,7 +672,7 @@ func (c *compileCtx) compileSchema(name string, s *openapi.Schema) (protobuf.Typ
 		}
 
 		c.pushParent(m)
-		if err := c.compileSchemaProperties(m, s.Properties); err != nil {
+		if err := c.compileSchemaProperties(m, s, s.Properties); err != nil {
 			c.popParent()
 			return nil, errors.Wrapf(err, `failed to compile properties for %s`, name)
 		}
@@ -713,13 +718,14 @@ func (c *compileCtx) compileSchema(name string, s *openapi.Schema) (protobuf.Typ
 	}
 }
 
-func (c *compileCtx) compileSchemaProperties(m *protobuf.Message, props map[string]*openapi.Schema) error {
+func (c *compileCtx) compileSchemaProperties(m *protobuf.Message, s *openapi.Schema, props map[string]*openapi.Schema) error {
 	var fields []struct {
 		comment  string
 		index    int
 		name     string
 		repeated bool
 		typ      protobuf.Type
+		optional bool
 	}
 
 	for propName, prop := range props {
@@ -729,7 +735,17 @@ func (c *compileCtx) compileSchemaProperties(m *protobuf.Message, props map[stri
 		copy = *prop
 		copy.Description = ""
 
-		name, typ, index, repeated, err := c.compileProperty(propName, &copy)
+		name, typ, index, repeated, optional, err := c.compileProperty(propName, &copy)
+		if optional == nil {
+			opt := true
+			for _, n := range s.Required {
+				if name == n {
+					opt = false
+					break
+				}
+			}
+			optional = &opt
+		}
 		if err != nil {
 			return errors.Wrapf(err, `failed to compile property %s`, propName)
 		}
@@ -739,12 +755,14 @@ func (c *compileCtx) compileSchemaProperties(m *protobuf.Message, props map[stri
 			name     string
 			repeated bool
 			typ      protobuf.Type
+			optional bool
 		}{
 			comment:  prop.Description,
 			index:    index,
 			name:     name,
 			repeated: repeated,
 			typ:      typ,
+			optional: *optional,
 		})
 	}
 
@@ -772,7 +790,9 @@ func (c *compileCtx) compileSchemaProperties(m *protobuf.Message, props map[stri
 		if field.repeated {
 			f.SetRepeated(true)
 		}
-
+		if field.optional {
+			f.SetOptional(true)
+		}
 		if v := field.comment; len(v) > 0 {
 			f.SetComment(v)
 		}
@@ -823,7 +843,7 @@ func (c *compileCtx) applyBuiltinFormat(t protobuf.Type, f string) (rt protobuf.
 
 // compiles a single property to a field.
 // local-scoped messages are handled in the compilation for the field type.
-func (c *compileCtx) compileProperty(name string, prop *openapi.Schema) (string, protobuf.Type, int, bool, error) {
+func (c *compileCtx) compileProperty(name string, prop *openapi.Schema) (string, protobuf.Type, int, bool, *bool, error) {
 	var typ protobuf.Type
 	var err error
 	var index int
@@ -834,14 +854,14 @@ func (c *compileCtx) compileProperty(name string, prop *openapi.Schema) (string,
 	if prop.Type.Len() > 1 {
 		typ, err = c.compileSchemaMultiType(typName, prop)
 		if err != nil {
-			return "", nil, index, false, errors.Wrap(err, `failed to compile schema with multiple types`)
+			return "", nil, index, false, nil, errors.Wrap(err, `failed to compile schema with multiple types`)
 		}
 	} else {
 		switch {
 		case prop.Type.Empty() || prop.Type.Contains("object"):
 			child, err := c.compileSchema(typName, prop)
 			if err != nil {
-				return "", nil, index, false, errors.Wrapf(err, `failed to compile object property %s`, name)
+				return "", nil, index, false, nil, errors.Wrapf(err, `failed to compile object property %s`, name)
 			}
 			typ = child
 		case prop.Type.Contains("array"):
@@ -850,7 +870,7 @@ func (c *compileCtx) compileProperty(name string, prop *openapi.Schema) (string,
 			copy.Description = ""
 			child, err := c.compileSchema(typName, &copy)
 			if err != nil {
-				return "", nil, index, false, errors.Wrapf(err, `failed to compile array property %s`, name)
+				return "", nil, index, false, nil, errors.Wrapf(err, `failed to compile array property %s`, name)
 			}
 			typ = child
 			// special case where optional array items can be specified as wrapped types
@@ -863,14 +883,14 @@ func (c *compileCtx) compileProperty(name string, prop *openapi.Schema) (string,
 				enumName := p.Name() + "_" + name
 				typ, err = c.compileEnum(enumName, prop.Enum)
 				if err != nil {
-					return "", nil, index, false, errors.Wrapf(err, `failed to compile enum for property %s`, name)
+					return "", nil, index, false, nil, errors.Wrapf(err, `failed to compile enum for property %s`, name)
 				}
 			} else {
 				typ, err = c.getType(prop.Type.First())
 				if err != nil {
 					typ, err = c.compileSchema(typName, prop)
 					if err != nil {
-						return "", nil, index, false, errors.Wrapf(err, `failed to compile protobuf type for property %s`, name)
+						return "", nil, index, false, nil, errors.Wrapf(err, `failed to compile protobuf type for property %s`, name)
 					}
 				}
 			}
@@ -883,11 +903,13 @@ func (c *compileCtx) compileProperty(name string, prop *openapi.Schema) (string,
 		}
 	}
 
+	var optional *bool
 	if p, ok := typ.(*Parameter); ok {
 		name = p.ParameterName()
 		typ = p.ParameterType()
 		index = p.ParameterNumber()
 		repeated = p.Repeated()
+		optional = &p.optional
 	} else {
 		if v := prop.ProtoName; v != "" {
 			name = v
@@ -904,7 +926,7 @@ func (c *compileCtx) compileProperty(name string, prop *openapi.Schema) (string,
 	case *protobuf.Message, *protobuf.Enum:
 		c.addType(typ)
 	}
-	return name, typ, index, repeated, nil
+	return name, typ, index, repeated, optional, nil
 }
 
 func (c *compileCtx) addImportForType(name string) {

@@ -8,6 +8,7 @@ type Parameter struct {
 	parameterName   string
 	parameterNumber int
 	repeated        bool
+	optional        bool
 }
 
 // ParameterType returns the underlying protobuf.Type
@@ -28,4 +29,8 @@ func (p *Parameter) ParameterNumber() int {
 // Repeated returns true if this parameter can be repeated
 func (p *Parameter) Repeated() bool {
 	return p.repeated
+}
+
+func (p *Parameter) Optional() bool {
+	return p.optional
 }
